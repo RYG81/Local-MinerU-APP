@@ -1,0 +1,27 @@
+{
+    "bucket_info": {},
+    "latex-delimiter-config": {
+        "display": {
+            "left": "$$",
+            "right": "$$"
+        },
+        "inline": {
+            "left": "$",
+            "right": "$"
+        }
+    },
+    "llm-aided-config": {
+        "title_aided": {
+            "api_key": "",
+            "base_url": "",
+            "model": "",
+            "enable_thinking": false,
+            "enable": false
+        }
+    },
+    "models-dir": {
+        "pipeline": "C:\\Users\\ryg01\\Downloads\\workspace-019ebcaa-2117-7643-a83c-d843e11c423a\\MinerU-Local\\models\\pipeline",
+        "vlm": "C:\\Users\\ryg01\\Downloads\\workspace-019ebcaa-2117-7643-a83c-d843e11c423a\\MinerU-Local\\models\\vlm"
+    },
+    "config_version": "1.3.1"
+}
