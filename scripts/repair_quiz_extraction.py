@@ -17,7 +17,7 @@ QUESTION_RE = re.compile(
 )
 BARE_QUESTION_RE = re.compile(r"^(\d{1,4})\s*[.)]\s*(.*)$")
 OPTION_RE = re.compile(
-    r"^(?:\(([a-h])\)|([a-h])[.)])\s*(.*)$", re.IGNORECASE
+    r"^(?:\(([a-h])\)|([a-h])[.)]|\(([1-8])\)|([1-8])[.)])\s*(.*)$"
 )
 FOOTER_RE = re.compile(
     r"^(?:\d+\s+)?www\.[^\s]+.*$|^Adda247 App$|^\|$", re.IGNORECASE
@@ -25,7 +25,6 @@ FOOTER_RE = re.compile(
 STRUCTURE_RE = re.compile(
     r"^(?:"
     r"Q(?:uestion)?\s*\d{1,4}\s*[.)]|"
-    r"(?:\([a-h]\)|[a-h][.)])|"
     r"Directions?\b|Instructions?\b|"
     r"Assumptions?\s*:|Courses? of Actions?\s*:|"
     r"Input\s*:|Step\s+[IVX]+\s*:|"
@@ -37,7 +36,14 @@ STRUCTURE_RE = re.compile(
 
 def normalize_line(line):
     line = line.replace("\u00a0", " ").replace("\u200b", "")
+    circled = {
+        character: str(number)
+        for number, character in enumerate("①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳", 1)
+    }
+    if line and line[0] in circled:
+        line = circled[line[0]] + line[1:]
     line = re.sub(r"\s+", " ", line).strip()
+    line = re.sub(r"\(\s*([a-h1-8])\s*\)", r"(\1)", line, flags=re.IGNORECASE)
     line = re.sub(r"\s+([,.;:?!])", r"\1", line)
     split_q = re.match(
         r"^Q(?:uestion)?\s*((?:\d\s*)+)([.)])\s*(.*)$",
@@ -176,11 +182,19 @@ def coordinate_pages(reader, max_pages=None):
 def logical_blocks(lines, allow_bare=False):
     blocks = []
     force_new = True
+    expanded_lines = []
     for line in lines:
+        if line is None:
+            expanded_lines.append(None)
+            continue
+        parts = re.split(r"(?=\([a-h1-8]\)\s*)", line)
+        expanded_lines.extend(part for part in parts if part.strip())
+
+    for line in expanded_lines:
         if line is None:
             force_new = True
             continue
-        starts_block = bool(STRUCTURE_RE.match(line)) or (
+        starts_block = bool(STRUCTURE_RE.match(line) or OPTION_RE.match(line)) or (
             allow_bare and bool(BARE_QUESTION_RE.match(line))
         )
         if not blocks or starts_block or force_new:
@@ -206,11 +220,12 @@ def question_number(block, allow_bare=False):
 def longest_sequence(numbers):
     if not numbers:
         return []
-    best = current = [numbers[0]]
-    for number in numbers[1:]:
+    ordered = sorted(set(numbers))
+    best = current = [ordered[0]]
+    for number in ordered[1:]:
         if number == current[-1] + 1:
             current.append(number)
-        elif number != current[-1]:
+        else:
             current = [number]
         if len(current) > len(best):
             best = current
@@ -218,7 +233,11 @@ def longest_sequence(numbers):
 
 
 def build_questions(
-    page_blocks, first_question=None, last_question=None, allow_bare=False
+    page_blocks,
+    first_question=None,
+    last_question=None,
+    allow_bare=False,
+    append_continuations=True,
 ):
     seen_numbers = [
         question_number(block, allow_bare)
@@ -234,6 +253,7 @@ def build_questions(
     questions = []
     current = None
     expected = first
+    skipping_duplicate = False
 
     for page_idx, blocks in enumerate(page_blocks):
         for block in blocks:
@@ -248,21 +268,38 @@ def build_questions(
                     "options": {},
                 }
                 expected += 1
+                skipping_duplicate = False
+                continue
+            if match:
+                skipping_duplicate = True
                 continue
             if not current:
                 continue
 
             option = OPTION_RE.match(block)
+            if skipping_duplicate and option:
+                continue
             if option:
-                key = (option.group(1) or option.group(2)).lower()
-                current["options"][key] = option.group(3).strip()
+                letter = option.group(1) or option.group(2)
+                number = option.group(3) or option.group(4)
+                key = (
+                    letter.lower()
+                    if letter
+                    else "abcdefgh"[int(number) - 1]
+                )
+                if key not in current["options"]:
+                    current["options"][key] = option.group(5).strip()
             elif current["options"] and STRUCTURE_RE.match(block):
                 continue
             elif current["options"]:
                 key = next(reversed(current["options"]))
-                current["options"][key] = f"{current['options'][key]} {block}".strip()
+                if not current["options"][key] or append_continuations:
+                    current["options"][key] = (
+                        f"{current['options'][key]} {block}".strip()
+                    )
             else:
-                current["question"] = f"{current['question']} {block}".strip()
+                if append_continuations:
+                    current["question"] = f"{current['question']} {block}".strip()
 
     if current:
         questions.append(current)
@@ -272,7 +309,10 @@ def build_questions(
 def contiguous_option_count(question):
     count = 0
     for letter in "abcdefgh":
-        if letter not in question["options"]:
+        if (
+            letter not in question["options"]
+            or not question["options"][letter].strip()
+        ):
             break
         count += 1
     return count
@@ -293,15 +333,8 @@ def infer_option_counts(questions):
     )
     inferred = {}
     for question in questions:
-        nearby = [
-            count for number, count in complete_counts.items()
-            if abs(number - question["number"]) <= 5
-        ]
-        inferred[question["number"]] = (
-            Counter(nearby).most_common(1)[0][0]
-            if nearby
-            else global_count
-        )
+        own_count = complete_counts.get(question["number"])
+        inferred[question["number"]] = own_count or global_count
     return inferred, dict(sorted(distribution.items()))
 
 
@@ -317,11 +350,11 @@ def validate_questions(questions, first, last, expected_options):
                 if auto_options
                 else int(expected_options)
             )]
-            if letter not in q["options"]
+            if letter not in q["options"] or not q["options"][letter].strip()
         ]
         for q in questions
         if any(
-            letter not in q["options"]
+            letter not in q["options"] or not q["options"][letter].strip()
             for letter in "abcdefgh"[:(
                 inferred_counts.get(q["number"], 0)
                 if auto_options
@@ -358,13 +391,18 @@ def analyze_candidate(
 ):
     blocks = [logical_blocks(page, allow_bare) for page in pages]
     questions, detected_first, detected_last = build_questions(
-        blocks, first, last, allow_bare
+        blocks,
+        first,
+        last,
+        allow_bare,
+        append_continuations=not name.startswith("mineru_v2"),
     )
     if not questions:
         return {
             "name": name,
             "pages": blocks,
             "questions": [],
+            "allow_bare": allow_bare,
             "report": {"valid": False, "error": "No sequential quiz detected"},
             "score": -math.inf,
         }
@@ -375,41 +413,36 @@ def analyze_candidate(
         "name": name,
         "pages": blocks,
         "questions": questions,
+        "allow_bare": allow_bare,
         "report": report,
         "score": candidate_score(report),
     }
 
 
-def render_markdown(page_blocks, valid_numbers, allow_bare=False):
+def render_markdown(questions):
     output = []
-    for page_idx, blocks in enumerate(page_blocks):
-        if page_idx:
-            output.extend(["", f"<!-- Page {page_idx + 1} -->", ""])
-        for block in blocks:
-            number = question_number(block, allow_bare)
-            if number in valid_numbers:
-                match = question_match(block, allow_bare)
-                output.extend(["", f"## Q{number}. {match.group(2).strip()}", ""])
-            elif block.lower().startswith(("direction", "instruction")):
-                output.extend(["", f"### {block}", ""])
-            else:
-                output.extend([block, ""])
+    for question in questions:
+        output.extend(["", f"## Q{question['number']}. {question['question']}", ""])
+        for key, value in sorted(question["options"].items()):
+            output.extend([f"({key}) {value}", ""])
     return "\n".join(output).strip() + "\n"
 
 
-def build_content_lists(page_blocks, valid_numbers, allow_bare=False):
-    flat, v2 = [], []
-    for page_idx, blocks in enumerate(page_blocks):
-        page_items = []
-        for block in blocks:
-            number = question_number(block, allow_bare)
-            is_heading = number in valid_numbers
-            is_directions = block.lower().startswith(("direction", "instruction"))
-            item_type = "title" if is_heading or is_directions else "paragraph"
+def build_content_lists(questions):
+    flat, pages = [], {}
+    for question in questions:
+        page_idx = question["page"] - 1
+        page_items = pages.setdefault(page_idx, [])
+        lines = [f"Q{question['number']}. {question['question']}"]
+        lines.extend(
+            f"({key}) {value}" for key, value in sorted(question["options"].items())
+        )
+        for line_idx, block in enumerate(lines):
+            item_type = "title" if line_idx == 0 else "paragraph"
             key = "title_content" if item_type == "title" else "paragraph_content"
             content = {key: [{"type": "text", "content": block}]}
             if item_type == "title":
-                content["level"] = 2 if is_heading else 3
+                content["level"] = 2
             page_items.append({
                 "type": item_type,
                 "content": content,
@@ -421,18 +454,65 @@ def build_content_lists(page_blocks, valid_numbers, allow_bare=False):
                 "page_idx": page_idx,
                 "source": "pdf_native_text",
             })
-        v2.append(page_items)
+    v2 = [pages.get(page_idx, []) for page_idx in range(max(pages, default=-1) + 1)]
     return flat, v2
 
 
-def compare_mineru(content_v2_path, first, last):
+def _content_text(value):
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return " ".join(filter(None, (_content_text(item) for item in value)))
+    if not isinstance(value, dict):
+        return ""
+    if value.get("type") == "text":
+        return str(value.get("content", ""))
+    if str(value.get("type", "")).startswith("equation"):
+        return _content_text(value.get("content", ""))
+    preferred = (
+        "title_content", "paragraph_content", "item_content",
+        "list_items", "math_content",
+    )
+    return " ".join(
+        filter(None, (_content_text(value.get(key)) for key in preferred if key in value))
+    )
+
+
+def mineru_v2_pages(content_v2_path, max_pages=None):
+    if not content_v2_path:
+        return []
+    data = json.loads(Path(content_v2_path).read_text(encoding="utf-8"))
+    if not isinstance(data, list):
+        return []
+    pages = []
+    for page in data[:max_pages]:
+        lines = []
+        for item in page if isinstance(page, list) else []:
+            item_type = item.get("type", "")
+            if item_type in {"image", "page_header", "page_footer", "page_number"}:
+                continue
+            if item_type == "list":
+                for list_item in item.get("content", {}).get("list_items", []):
+                    text = normalize_line(_content_text(list_item))
+                    if text:
+                        lines.append(text)
+                continue
+            text = normalize_line(_content_text(item.get("content", {})))
+            if text:
+                lines.append(text)
+        pages.append(lines)
+    return pages
+
+
+def compare_mineru(content_v2_path, first, last, allow_bare=False):
     if not content_v2_path:
         return None
-    data = json.loads(Path(content_v2_path).read_text(encoding="utf-8"))
-    text = json.dumps(data, ensure_ascii=False)
-    found = {int(value) for value in re.findall(
-        r"\bQ\s*(\d{1,4})\s*[.)]", text, re.IGNORECASE
-    )}
+    found = {
+        number
+        for page in mineru_v2_pages(content_v2_path)
+        for line in page
+        if (number := question_number(line, allow_bare)) is not None
+    }
     return {
         "questions_found": len([n for n in found if first <= n <= last]),
         "missing_questions": [
@@ -456,23 +536,27 @@ def repair_quiz_pdf(
     prefix.parent.mkdir(parents=True, exist_ok=True)
 
     reader = PdfReader(str(pdf_path))
+    sources = [
+        ("native_stream", stream_pages(reader, max_pages)),
+        ("coordinate_columns", coordinate_pages(reader, max_pages)),
+    ]
+    mineru_pages = mineru_v2_pages(mineru_content_v2, max_pages)
+    if mineru_pages:
+        sources.append(("mineru_v2", mineru_pages))
+    bare_modes = [allow_bare_question_numbers]
+    if not allow_bare_question_numbers:
+        bare_modes.append(True)
     candidates = [
         analyze_candidate(
-            "native_stream",
-            stream_pages(reader, max_pages),
+            f"{name}{'_bare' if allow_bare else ''}",
+            pages,
             first_question,
             last_question,
             expected_options,
-            allow_bare_question_numbers,
-        ),
-        analyze_candidate(
-            "coordinate_columns",
-            coordinate_pages(reader, max_pages),
-            first_question,
-            last_question,
-            expected_options,
-            allow_bare_question_numbers,
-        ),
+            allow_bare,
+        )
+        for name, pages in sources
+        for allow_bare in bare_modes
     ]
     best = max(candidates, key=lambda candidate: candidate["score"])
     report = dict(best["report"])
@@ -494,16 +578,12 @@ def repair_quiz_pdf(
         mineru_content_v2,
         report["first_question"],
         report["last_question"],
+        best["allow_bare"],
     )
 
-    valid_numbers = {q["number"] for q in best["questions"]}
-    flat, v2 = build_content_lists(
-        best["pages"], valid_numbers, allow_bare_question_numbers
-    )
+    flat, v2 = build_content_lists(best["questions"])
     prefix.with_suffix(".md").write_text(
-        render_markdown(
-            best["pages"], valid_numbers, allow_bare_question_numbers
-        ),
+        render_markdown(best["questions"]),
         encoding="utf-8",
     )
     prefix.with_suffix(".json").write_text(
