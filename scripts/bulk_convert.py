@@ -48,7 +48,39 @@ def main():
                     choices=["pipeline", "vlm-engine", "hybrid-engine"],
                     help="pipeline = fastest & lowest VRAM (default); "
                          "vlm-engine / hybrid-engine = higher quality, slower")
-    ap.add_argument("--lang", default="en", help="OCR language hint (pipeline)")
+    ap.add_argument("-m", "--method", default="auto",
+                    choices=["auto", "txt", "ocr"],
+                    help="auto detects text/scans; use ocr for scanned PDFs")
+    ap.add_argument("--lang", default="en",
+                    help="OCR language hint for pipeline, e.g. devanagari "
+                         "for Hindi (default: en)")
+    ap.add_argument("--effort", default="medium",
+                    choices=["medium", "high"],
+                    help="hybrid effort; medium avoids image/chart narration, "
+                         "high enables deeper visual analysis")
+    ap.add_argument(
+        "--image-analysis",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="analyze images/charts with VLM (default: disabled for clean "
+             "text extraction; use --image-analysis for visual documents)",
+    )
+    ap.add_argument("--formula", action=argparse.BooleanOptionalAction,
+                    default=True, help="enable formula recognition")
+    ap.add_argument("--table", action=argparse.BooleanOptionalAction,
+                    default=True, help="enable table recognition")
+    ap.add_argument(
+        "--quiz-repair",
+        action="store_true",
+        help="audit born-digital quiz PDFs and generate validated native-text "
+             "quiz artifacts beside MinerU output",
+    )
+    ap.add_argument(
+        "--quiz-options",
+        default="auto",
+        choices=["auto", "2", "3", "4", "5", "6", "7", "8"],
+        help="expected quiz options; auto detects per document/section",
+    )
     ap.add_argument("--no-zip", action="store_true", help="skip ZIP packaging")
     ap.add_argument("--batch-size", type=int, default=384,
                     help="MINERU_MIN_BATCH_INFERENCE_SIZE (higher = faster on "
@@ -68,10 +100,16 @@ def main():
     stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
     out_dir = Path(args.out) / stamp
     out_dir.mkdir(parents=True, exist_ok=True)
+    temp_dir = ROOT / "output" / ".tmp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
 
     log(f"Bulk conversion started  |  log: {LOG_FILE}")
     log(f"  files   : {len(files)}")
     log(f"  backend : {args.backend}")
+    log(f"  method  : {args.method}")
+    log(f"  language: {args.lang}")
+    log(f"  effort  : {args.effort}")
+    log(f"  images  : {'analyze' if args.image_analysis else 'extract only'}")
     log(f"  output  : {out_dir}")
 
     # offline + project-local env (same as run.bat)
@@ -84,6 +122,8 @@ def main():
         "HF_HOME": str(ROOT / "hf-cache"),
         "FTLANG_CACHE": str(ROOT / "models" / "fasttext"),
         "HF_HUB_DISABLE_TELEMETRY": "1",
+        "TEMP": str(temp_dir),
+        "TMP": str(temp_dir),
         # speed: bigger inference batches (pipeline backend)
         "MINERU_MIN_BATCH_INFERENCE_SIZE": str(args.batch_size),
         "MINERU_LOG_LEVEL": "INFO",
@@ -93,7 +133,13 @@ def main():
     t0 = time.time()
     cmd = [sys.executable, "-m", "mineru.cli.client",
            "-p", str(src), "-o", str(out_dir),
-           "-b", args.backend, "--lang", args.lang]
+           "-b", args.backend,
+           "-m", args.method,
+           "--lang", args.lang,
+           "--effort", args.effort,
+           "--image-analysis", str(args.image_analysis).lower(),
+           "--formula", str(args.formula).lower(),
+           "--table", str(args.table).lower()]
     log(f"  running : {' '.join(cmd)}")
     with open(LOG_FILE, "a", encoding="utf-8") as lf:
         proc = subprocess.run(cmd, env=env, stdout=lf, stderr=subprocess.STDOUT)
@@ -115,9 +161,58 @@ def main():
     for f in missing:
         log(f"  FAILED   : {f.name}  (see log for the mineru error)")
 
+    quiz_repairs = []
+    if args.quiz_repair:
+        repair_script = ROOT / "scripts" / "repair_quiz_extraction.py"
+        for source_file, stem_dir in results:
+            if source_file.suffix.lower() != ".pdf":
+                continue
+            result_dirs = sorted(
+                {path.parent for path in stem_dir.rglob("*_content_list_v2.json")}
+            )
+            if not result_dirs:
+                continue
+            result_dir = result_dirs[0]
+            content_v2 = next(result_dir.glob("*_content_list_v2.json"))
+            prefix = result_dir / f"{source_file.stem}_quiz_repaired"
+            repair_cmd = [
+                sys.executable, str(repair_script), str(source_file),
+                "-o", str(prefix),
+                "--expected-options", str(args.quiz_options),
+                "--mineru-content-v2", str(content_v2),
+            ]
+            repair = subprocess.run(
+                repair_cmd, env=env, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+                errors="replace",
+            )
+            report_path = prefix.with_name(f"{prefix.name}_report.json")
+            if repair.returncode == 0 and report_path.exists():
+                report = json.loads(report_path.read_text(encoding="utf-8"))
+                quiz_repairs.append({
+                    "file": str(source_file),
+                    "valid": report.get("valid", False),
+                    "report": str(report_path),
+                })
+                log(
+                    f"  quiz OK  : {source_file.name} "
+                    f"({report['extracted_questions']} questions)"
+                )
+            else:
+                quiz_repairs.append({
+                    "file": str(source_file),
+                    "valid": False,
+                    "error": repair.stdout[-1000:],
+                })
+                log(f"  quiz skip: {source_file.name} (validation failed)")
+
     # summary json
     summary = {
         "started": stamp, "backend": args.backend,
+        "method": args.method, "language": args.lang,
+        "effort": args.effort, "image_analysis": args.image_analysis,
+        "formula": args.formula, "table": args.table,
+        "quiz_repairs": quiz_repairs,
         "files_total": len(files), "files_ok": len(results),
         "files_failed": [str(f) for f in missing],
         "seconds": round(took, 1), "output_dir": str(out_dir),
